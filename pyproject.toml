@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "qianli"
-version = "0.1.1"
-description = "Search Chinese content platforms (WeChat, 36kr, XHS) via Chrome DevTools Protocol"
+version = "0.2.0"
+description = "Search Chinese content platforms (WeChat, 36kr, XHS, Zhihu) via Chrome DevTools Protocol"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 authors = [{ name = "Terry Li", email = "terry@terryli.dev" }]
-keywords = ["chinese", "search", "wechat", "xiaohongshu", "cdp", "chrome"]
+keywords = ["chinese", "search", "wechat", "xiaohongshu", "zhihu", "cdp", "chrome"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",

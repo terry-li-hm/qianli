@@ -1,7 +1,7 @@
-"""qianli: Search Chinese content platforms via CDP Chrome.
+"""qianli: Search Chinese content platforms.
 
-Sources: WeChat 公众号 (Sogou), 36kr, XHS (小红书).
-Connects directly to Chrome DevTools Protocol on port 9222.
+Sources: WeChat 公众号 (Sogou), 36kr via direct CDP. XHS, Zhihu via MediaCrawler.
+Connects to Chrome DevTools Protocol on port 9222.
 """
 
 import argparse
@@ -12,6 +12,8 @@ import sys
 import time
 import urllib.request
 from urllib.parse import quote
+
+from qianli.mc import run_mc_search
 
 CDP_PORT = 9222
 CDP_BASE = f"http://localhost:{CDP_PORT}"
@@ -223,52 +225,6 @@ JS_36KR = """
 })()
 """
 
-JS_XHS = """
-(() => {
-    const items = document.querySelectorAll('section.note-item');
-    const results = [];
-    for (const item of items) {
-        const titleEl = item.querySelector('.footer .title span');
-        const authorEl = item.querySelector('.author .name');
-        const linkEl = item.querySelector('a.cover');
-        const likeEl = item.querySelector('.like-wrapper .count');
-        const footerText = item.querySelector('.footer')?.innerText || '';
-
-        const title = titleEl?.textContent?.trim() || '';
-        const author = authorEl?.textContent?.trim() || '';
-        const href = linkEl?.getAttribute('href') || '';
-        const likes = likeEl?.textContent?.trim() || '';
-
-        // Extract date from footer text (title\\nauthor\\ndate\\nlikes)
-        const lines = footerText.split('\\n').map(l => l.trim()).filter(Boolean);
-        let date = '';
-        for (const line of lines) {
-            if (/^\\d{4}-\\d{2}-\\d{2}$/.test(line) || /^\\d{2}-\\d{2}$/.test(line) || /小时前|天前|昨天/.test(line)) {
-                date = line;
-                break;
-            }
-        }
-
-        // Extract note ID from href for canonical URL
-        const idMatch = href.match(/\\/(explore|search_result)\\/([a-f0-9]+)/);
-        const noteId = idMatch ? idMatch[2] : '';
-        const canonicalUrl = noteId ? 'https://www.xiaohongshu.com/explore/' + noteId : '';
-
-        if (title && canonicalUrl) {
-            results.push({
-                source: 'xhs',
-                title,
-                url: canonicalUrl,
-                author: '@' + author,
-                date,
-                likes
-            });
-        }
-    }
-    return JSON.stringify(results);
-})()
-"""
-
 
 # --- Search functions ---
 
@@ -308,24 +264,13 @@ def search_36kr(query, limit=5):
 
 
 def search_xhs(query, limit=5):
-    """Search XHS posts (requires CDP login)."""
-    url = f"https://www.xiaohongshu.com/search_result?keyword={quote(query)}&type=51"
-    result = _open_and_extract(
-        url,
-        JS_XHS,
-        wait_secs=4,
-        max_wait=15,
-        ready_check="document.querySelectorAll('section.note-item').length > 0",
-    )
-    if not result:
-        # Check if it's a login wall
-        print(
-            "[xhs] Error: no results (not logged in, or page did not load)",
-            file=sys.stderr,
-        )
-        return []
-    items = json.loads(result)
-    return items[:limit]
+    """Search XHS posts via MediaCrawler."""
+    return run_mc_search("xhs", query, limit)
+
+
+def search_zhihu(query, limit=5):
+    """Search Zhihu content via MediaCrawler."""
+    return run_mc_search("zhihu", query, limit)
 
 
 def read_url(url):
@@ -384,11 +329,19 @@ def format_json(results):
 
 # --- CLI ---
 
-SOURCES = {
+# CDP-based sources (fast, direct)
+CDP_SOURCES = {
     "wechat": search_wechat,
     "36kr": search_36kr,
-    "xhs": search_xhs,
 }
+
+# MediaCrawler-based sources (slower, subprocess)
+MC_SOURCES = {
+    "xhs": search_xhs,
+    "zhihu": search_zhihu,
+}
+
+ALL_SOURCES = {**CDP_SOURCES, **MC_SOURCES}
 
 
 def main():
@@ -397,13 +350,13 @@ def main():
     )
     sub = parser.add_subparsers(dest="command")
 
-    for name in SOURCES:
+    for name in ALL_SOURCES:
         p = sub.add_parser(name, help=f"Search {name}")
         p.add_argument("query", help="Search query")
         p.add_argument("--limit", type=int, default=5)
         p.add_argument("--json", action="store_true", dest="json_out")
 
-    p_all = sub.add_parser("all", help="Search all available sources")
+    p_all = sub.add_parser("all", help="Search wechat + 36kr (fast CDP sources)")
     p_all.add_argument("query", help="Search query")
     p_all.add_argument("--limit", type=int, default=3)
     p_all.add_argument("--json", action="store_true", dest="json_out")
@@ -430,9 +383,10 @@ def main():
 
     if args.command == "all":
         all_results = []
-        for name in SOURCES:
+        # "all" runs only fast CDP sources (wechat + 36kr)
+        for name, fn in CDP_SOURCES.items():
             try:
-                results = SOURCES[name](args.query, args.limit)
+                results = fn(args.query, args.limit)
                 all_results.extend(results)
             except Exception as e:
                 print(f"[{name}] Error: {e}", file=sys.stderr)
@@ -442,8 +396,8 @@ def main():
             format_text(all_results)
         return
 
-    if args.command in SOURCES:
-        results = SOURCES[args.command](args.query, args.limit)
+    if args.command in ALL_SOURCES:
+        results = ALL_SOURCES[args.command](args.query, args.limit)
         if args.json_out:
             format_json(results)
         else:
