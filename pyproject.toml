@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "qianli"
-version = "0.1.0"
+version = "0.1.1"
 description = "Search Chinese content platforms (WeChat, 36kr, XHS) via Chrome DevTools Protocol"
 readme = "README.md"
 license = "MIT"
