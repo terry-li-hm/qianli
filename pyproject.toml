@@ -30,4 +30,3 @@ Repository = "https://github.com/terry-li-hm/qianli"
 
 [project.scripts]
 qianli = "qianli.cli:main"
-cn-search = "qianli.cli:main"
