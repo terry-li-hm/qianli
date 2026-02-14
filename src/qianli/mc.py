@@ -61,6 +61,20 @@ def _find_contents_json(output_dir, platform):
     return None
 
 
+def _ts_to_date(ts):
+    """Convert unix timestamp (ms or s) to YYYY-MM-DD."""
+    if not ts:
+        return ""
+    try:
+        ts = int(ts)
+        if ts > 1e12:  # milliseconds
+            ts = ts // 1000
+        from datetime import datetime
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+    except (ValueError, OSError):
+        return str(ts)
+
+
 def _normalize_xhs(items):
     """Normalize XHS results to qianli format."""
     results = []
@@ -77,7 +91,7 @@ def _normalize_xhs(items):
                 "url": note_url,
                 "snippet": (item.get("desc") or "")[:120],
                 "author": f"@{item.get('nickname', '')}",
-                "date": item.get("time", ""),
+                "date": _ts_to_date(item.get("time")),
                 "likes": str(item.get("liked_count", "")),
             }
         )
@@ -95,7 +109,7 @@ def _normalize_zhihu(items):
                 "url": item.get("url", ""),
                 "snippet": (item.get("desc") or "")[:120],
                 "author": item.get("nickname", ""),
-                "date": item.get("time", ""),
+                "date": _ts_to_date(item.get("time")),
             }
         )
     return results
@@ -145,12 +159,11 @@ def run_mc_search(platform, query, limit=5):
             cmd,
             cwd=str(MC_DIR),
             capture_output=True,
-            text=True,
             timeout=120,
         )
 
         if result.returncode != 0:
-            stderr = result.stderr.strip()
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
             # Filter out common noise
             if stderr:
                 for line in stderr.split("\n"):

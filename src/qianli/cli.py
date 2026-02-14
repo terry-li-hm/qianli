@@ -302,9 +302,9 @@ def format_text(results):
         title = r["title"]
         meta_parts = []
         if r.get("author"):
-            meta_parts.append(r["author"])
+            meta_parts.append(str(r["author"]))
         if r.get("date"):
-            meta_parts.append(r["date"])
+            meta_parts.append(str(r["date"]))
         if r.get("likes"):
             meta_parts.append(f"❤ {r['likes']}")
         meta = " · ".join(meta_parts)
