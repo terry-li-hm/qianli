@@ -7,7 +7,6 @@ Connects to Chrome DevTools Protocol on port 9222.
 import argparse
 import asyncio
 import json
-import re
 import sys
 import time
 import urllib.request
