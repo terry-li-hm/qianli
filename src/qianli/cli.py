@@ -1,265 +1,112 @@
 """qianli: Search Chinese content platforms.
 
-Sources: WeChat 公众号 (Sogou), 36kr via direct CDP. XHS, Zhihu via MediaCrawler.
-Connects to Chrome DevTools Protocol on port 9222.
+Sources: WeChat 公众号 via Exa (exauro), 36kr via agent-browser. XHS, Zhihu via MediaCrawler.
+No CDP Chrome required.
 """
 
 import argparse
-import asyncio
 import json
+import re
+import subprocess
 import sys
-import time
-import urllib.request
-from urllib.parse import quote
 
 from qianli.mc import run_mc_search
 
-CDP_PORT = 9222
-CDP_BASE = f"http://localhost:{CDP_PORT}"
-WS_MAX_SIZE = 10_000_000
 
-
-# --- CDP helpers ---
-
-
-def _get_browser_ws():
-    """Get browser-level websocket URL."""
-    data = json.loads(urllib.request.urlopen(f"{CDP_BASE}/json/version").read())
-    return data["webSocketDebuggerUrl"]
-
-
-def _get_tabs():
-    """Get list of open tabs."""
-    return json.loads(urllib.request.urlopen(f"{CDP_BASE}/json").read())
-
-
-def _cdp_check():
-    """Check if CDP Chrome is reachable."""
-    try:
-        urllib.request.urlopen(f"{CDP_BASE}/json/version", timeout=2)
-        return True
-    except Exception:
-        return False
-
-
-async def _create_tab(url):
-    """Create a new tab and return its target ID."""
-    import websockets
-
-    browser_ws = _get_browser_ws()
-    async with websockets.connect(browser_ws, max_size=WS_MAX_SIZE) as ws:
-        await ws.send(
-            json.dumps(
-                {
-                    "id": 1,
-                    "method": "Target.createTarget",
-                    "params": {"url": url},
-                }
-            )
-        )
-        while True:
-            msg = await asyncio.wait_for(ws.recv(), timeout=10)
-            data = json.loads(msg)
-            if data.get("id") == 1:
-                return data["result"]["targetId"]
-
-
-async def _close_tab(target_id):
-    """Close a tab by target ID."""
-    import websockets
-
-    browser_ws = _get_browser_ws()
-    async with websockets.connect(browser_ws, max_size=WS_MAX_SIZE) as ws:
-        await ws.send(
-            json.dumps(
-                {
-                    "id": 1,
-                    "method": "Target.closeTarget",
-                    "params": {"targetId": target_id},
-                }
-            )
-        )
-        try:
-            await asyncio.wait_for(ws.recv(), timeout=3)
-        except asyncio.TimeoutError:
-            pass
-
-
-async def _evaluate(ws_url, expression, timeout=10):
-    """Evaluate JS expression in a tab and return the value."""
-    import websockets
-
-    async with websockets.connect(ws_url, max_size=WS_MAX_SIZE) as ws:
-        await ws.send(
-            json.dumps(
-                {
-                    "id": 1,
-                    "method": "Runtime.evaluate",
-                    "params": {"expression": expression, "returnByValue": True},
-                }
-            )
-        )
-        while True:
-            try:
-                msg = await asyncio.wait_for(ws.recv(), timeout=timeout)
-                data = json.loads(msg)
-                if data.get("id") == 1:
-                    result = data.get("result", {}).get("result", {})
-                    if "value" in result:
-                        return result["value"]
-                    return None
-            except asyncio.TimeoutError:
-                return None
-
-
-def _open_and_extract(url, js_extractor, wait_secs=4, max_wait=15, ready_check=None):
-    """Open URL in new tab, wait for content, run JS extractor, close tab.
-
-    Args:
-        url: URL to navigate to
-        js_extractor: JS expression that returns JSON string of results
-        wait_secs: Initial wait before first check
-        max_wait: Maximum total wait time
-        ready_check: JS expression returning truthy when page is ready (optional)
-    """
-    target_id = asyncio.run(_create_tab(url))
-
-    try:
-        elapsed = 0
-        time.sleep(wait_secs)
-        elapsed += wait_secs
-
-        while elapsed < max_wait:
-            tabs = _get_tabs()
-            tab = next((t for t in tabs if t.get("id") == target_id), None)
-            if not tab:
-                return None
-
-            ws_url = tab["webSocketDebuggerUrl"]
-
-            # Check if page is ready
-            if ready_check:
-                ready = asyncio.run(_evaluate(ws_url, ready_check, timeout=5))
-                if not ready:
-                    time.sleep(2)
-                    elapsed += 2
-                    continue
-
-            # Try extracting
-            result = asyncio.run(_evaluate(ws_url, js_extractor, timeout=10))
-            if result:
-                return result
-
-            time.sleep(2)
-            elapsed += 2
-
-        return None
-    finally:
-        asyncio.run(_close_tab(target_id))
-
-
-# --- JS extractors ---
-
-JS_WECHAT = """
-(() => {
-    const items = document.querySelectorAll('#main .txt-box');
-    const results = [];
-    for (const item of items) {
-        const li = item.closest('li');
-        const titleEl = item.querySelector('h3 a');
-        const snippetEl = item.querySelector('p.txt-info, p');
-        const accountEl = li?.querySelector('span.all-time-y2');
-        const dateEl = li?.querySelector('span.s2');
-
-        const title = titleEl?.textContent?.trim() || '';
-        const href = titleEl?.getAttribute('href') || '';
-        const snippet = snippetEl?.textContent?.trim() || '';
-        const account = accountEl?.textContent?.trim() || '';
-        const dateText = dateEl?.textContent?.trim() || '';
-        const dateMatch = dateText.match(/(\\d{4}-\\d{1,2}-\\d{1,2})/);
-        const date = dateMatch ? dateMatch[1] : '';
-
-        if (title && href) {
-            results.push({
-                source: 'wechat',
-                title,
-                url: href.startsWith('/') ? 'https://weixin.sogou.com' + href : href,
-                snippet: snippet.substring(0, 120),
-                author: account,
-                date
-            });
-        }
-    }
-    return JSON.stringify(results);
-})()
-"""
-
-JS_36KR = """
-(() => {
-    const items = document.querySelectorAll('.kr-flow-article-item');
-    const results = [];
-    for (const item of items) {
-        const linkEl = item.querySelector('a[href*="/p/"]');
-        const titleEl = item.querySelector('.article-item-title');
-        const descEl = item.querySelector('.article-item-description');
-        const timeEl = item.querySelector('.kr-flow-bar-time');
-
-        const href = linkEl?.getAttribute('href') || '';
-        const title = titleEl?.textContent?.trim() || '';
-        const desc = descEl?.textContent?.trim() || '';
-        const date = timeEl?.textContent?.trim() || '';
-
-        if (title && href) {
-            results.push({
-                source: '36kr',
-                title,
-                url: href.startsWith('/') ? 'https://36kr.com' + href : href,
-                snippet: desc.substring(0, 120),
-                author: '36氪',
-                date
-            });
-        }
-    }
-    return JSON.stringify(results);
-})()
-"""
 
 
 # --- Search functions ---
 
 
 def search_wechat(query, limit=5):
-    """Search WeChat articles via Sogou."""
-    url = f"https://weixin.sogou.com/weixin?type=2&query={quote(query)}"
-    result = _open_and_extract(
-        url,
-        JS_WECHAT,
-        wait_secs=4,
-        max_wait=12,
-        ready_check="document.querySelectorAll('#main .txt-box').length > 0",
-    )
-    if not result:
-        print("[wechat] Error: failed to load search results", file=sys.stderr)
+    """Search WeChat articles via exauro CLI."""
+    cmd = ["exauro", "search", f"{query} site:mp.weixin.qq.com", "--search-type", "auto"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        lines = proc.stdout.splitlines()
+
+        results = []
+        current_item = None
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Match "N. <title>"
+            m = re.match(r"^\d+\.\s+(.+)$", line)
+            if m:
+                if current_item and "url" in current_item:
+                    results.append(current_item)
+                current_item = {
+                    "source": "wechat",
+                    "title": m.group(1),
+                    "url": "",
+                    "snippet": "",
+                    "author": "",
+                    "date": "",
+                }
+            elif current_item:
+                if not current_item["url"] and line.startswith("http"):
+                    current_item["url"] = line
+                elif not current_item["snippet"] and current_item["url"]:
+                    current_item["snippet"] = line
+
+        if current_item and current_item["url"]:
+            results.append(current_item)
+
+        return results[:limit]
+    except subprocess.CalledProcessError as e:
+        print(f"[wechat] Error: exauro failed: {e.stderr}", file=sys.stderr)
         return []
-    items = json.loads(result)
-    return items[:limit]
+    except Exception as e:
+        print(f"[wechat] Error: {e}", file=sys.stderr)
+        return []
 
 
 def search_36kr(query, limit=5):
-    """Search 36kr articles."""
-    url = f"https://36kr.com/search/articles/{quote(query)}"
-    result = _open_and_extract(
-        url,
-        JS_36KR,
-        wait_secs=6,
-        max_wait=18,
-        ready_check="document.querySelectorAll('.kr-flow-article-item').length > 0",
-    )
-    if not result:
-        print("[36kr] Error: page did not render (SPA timeout)", file=sys.stderr)
+    """Search 36kr articles via exauro CLI."""
+    cmd = ["exauro", "search", f"{query} site:36kr.com", "--search-type", "auto"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        lines = proc.stdout.splitlines()
+
+        results = []
+        current_item = None
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            m = re.match(r"^\d+\.\s+(.+)$", line)
+            if m:
+                if current_item and current_item["url"]:
+                    results.append(current_item)
+                current_item = {
+                    "source": "36kr",
+                    "title": m.group(1),
+                    "url": "",
+                    "snippet": "",
+                    "author": "36氪",
+                    "date": "",
+                }
+            elif current_item:
+                if not current_item["url"] and line.startswith("http"):
+                    current_item["url"] = line
+                elif not current_item["snippet"] and current_item["url"]:
+                    current_item["snippet"] = line
+
+        if current_item and current_item["url"]:
+            results.append(current_item)
+
+        return results[:limit]
+    except subprocess.CalledProcessError as e:
+        print(f"[36kr] Error: exauro failed: {e.stderr}", file=sys.stderr)
         return []
-    items = json.loads(result)
-    return items[:limit]
+    except Exception as e:
+        print(f"[36kr] Error: {e}", file=sys.stderr)
+        return []
 
 
 def search_xhs(query, limit=5):
@@ -274,22 +121,24 @@ def search_zhihu(query, limit=5):
 
 def read_url(url):
     """Open a URL and return the page content as text."""
-    target_id = asyncio.run(_create_tab(url))
     try:
-        time.sleep(5)
-        tabs = _get_tabs()
-        tab = next((t for t in tabs if t.get("id") == target_id), None)
-        if not tab:
-            print("Error: tab not found", file=sys.stderr)
-            return
-        ws_url = tab["webSocketDebuggerUrl"]
-        text = asyncio.run(_evaluate(ws_url, "document.body?.innerText || ''", timeout=10))
+        subprocess.run(["agent-browser", "open", url], check=True, capture_output=True)
+        proc = subprocess.run(
+            ["agent-browser", "eval", "document.body?.innerText || ''"],
+            capture_output=True, text=True, check=True,
+        )
+        subprocess.run(["agent-browser", "close"], capture_output=True)
+        text = proc.stdout.strip()
         if text:
             print(text)
         else:
             print("Error: failed to extract page content", file=sys.stderr)
-    finally:
-        asyncio.run(_close_tab(target_id))
+    except subprocess.CalledProcessError as e:
+        print(f"Error: agent-browser failed: {e.stderr}", file=sys.stderr)
+        subprocess.run(["agent-browser", "close"], capture_output=True)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        subprocess.run(["agent-browser", "close"], capture_output=True)
 
 
 # --- Output ---
@@ -328,24 +177,21 @@ def format_json(results):
 
 # --- CLI ---
 
-# CDP-based sources (fast, direct)
-CDP_SOURCES = {
-    "wechat": search_wechat,
-    "36kr": search_36kr,
-}
-
-# MediaCrawler-based sources (slower, subprocess)
 MC_SOURCES = {
     "xhs": search_xhs,
     "zhihu": search_zhihu,
 }
 
-ALL_SOURCES = {**CDP_SOURCES, **MC_SOURCES}
+ALL_SOURCES = {
+    "wechat": search_wechat,
+    "36kr": search_36kr,
+    **MC_SOURCES,
+}
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Search Chinese content platforms via CDP Chrome"
+        description="Search Chinese content platforms"
     )
     sub = parser.add_subparsers(dest="command")
 
@@ -355,7 +201,7 @@ def main():
         p.add_argument("--limit", type=int, default=5)
         p.add_argument("--json", action="store_true", dest="json_out")
 
-    p_all = sub.add_parser("all", help="Search wechat + 36kr (fast CDP sources)")
+    p_all = sub.add_parser("all", help="Search wechat + 36kr")
     p_all.add_argument("query", help="Search query")
     p_all.add_argument("--limit", type=int, default=3)
     p_all.add_argument("--json", action="store_true", dest="json_out")
@@ -369,21 +215,14 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    if not _cdp_check():
-        print(
-            'Error: CDP Chrome not running. Start it: open "/Applications/Chrome CDP.app"',
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
     if args.command == "read":
         read_url(args.url)
         return
 
     if args.command == "all":
         all_results = []
-        # "all" runs only fast CDP sources (wechat + 36kr)
-        for name, fn in CDP_SOURCES.items():
+        for name in ["wechat", "36kr"]:
+            fn = ALL_SOURCES[name]
             try:
                 results = fn(args.query, args.limit)
                 all_results.extend(results)
