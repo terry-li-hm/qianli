@@ -1,18 +1,21 @@
 """qianli: Search Chinese content platforms.
 
-Sources: WeChat 公众号 via Exa (exauro), 36kr via agent-browser. XHS, Zhihu via MediaCrawler.
-No CDP Chrome required.
+Sources: WeChat 公众号 (Exauro), 36kr (agent-browser), XHS, Zhihu (MediaCrawler).
 """
 
 import argparse
 import json
-import re
-import subprocess
 import sys
+import subprocess
+import re
+from urllib.parse import quote
 
 from qianli.mc import run_mc_search
 
 
+# --- JS extractors ---
+
+JS_36KR = """(() => { const items = document.querySelectorAll('.kr-flow-article-item'); const results = []; for (const item of items) { const linkEl = item.querySelector('a[href*="/p/"]'); const titleEl = item.querySelector('.article-item-title'); const descEl = item.querySelector('.article-item-description'); const timeEl = item.querySelector('.kr-flow-bar-time'); const href = (linkEl && linkEl.getAttribute('href')) || ''; const title = (titleEl && titleEl.textContent && titleEl.textContent.trim()) || ''; const desc = (descEl && descEl.textContent && descEl.textContent.trim()) || ''; const date = (timeEl && timeEl.textContent && timeEl.textContent.trim()) || ''; if (title && href) { results.push({ source: '36kr', title, url: href.startsWith('/') ? 'https://36kr.com' + href : href, snippet: desc.substring(0, 120), author: '36氪', date }); } } return JSON.stringify(results); })()"""
 
 
 # --- Search functions ---
@@ -24,37 +27,36 @@ def search_wechat(query, limit=5):
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
         lines = proc.stdout.splitlines()
-
+        
         results = []
         current_item = None
-
+        
         for line in lines:
             line = line.strip()
             if not line:
                 continue
-
+                
             # Match "N. <title>"
-            m = re.match(r"^\d+\.\s+(.+)$", line)
-            if m:
-                if current_item and "url" in current_item:
+            match = re.match(r"^\d+\.\s+(.+)$", line)
+            if match:
+                if current_item and "title" in current_item:
                     results.append(current_item)
                 current_item = {
                     "source": "wechat",
-                    "title": m.group(1),
-                    "url": "",
-                    "snippet": "",
+                    "title": match.group(1),
                     "author": "",
-                    "date": "",
+                    "date": ""
                 }
             elif current_item:
-                if not current_item["url"] and line.startswith("http"):
-                    current_item["url"] = line
-                elif not current_item["snippet"] and current_item["url"]:
+                if "url" not in current_item:
+                    if line.startswith("http"):
+                        current_item["url"] = line
+                elif "snippet" not in current_item:
                     current_item["snippet"] = line
-
-        if current_item and current_item["url"]:
+        
+        if current_item and "title" in current_item:
             results.append(current_item)
-
+            
         return results[:limit]
     except subprocess.CalledProcessError as e:
         print(f"[wechat] Error: exauro failed: {e.stderr}", file=sys.stderr)
@@ -65,47 +67,30 @@ def search_wechat(query, limit=5):
 
 
 def search_36kr(query, limit=5):
-    """Search 36kr articles via exauro CLI."""
-    cmd = ["exauro", "search", f"{query} site:36kr.com", "--search-type", "auto"]
+    """Search 36kr articles via agent-browser CLI."""
+    url = f"https://36kr.com/search/articles/{quote(query)}"
+    # Escaping JS for shell
+    js_escaped = JS_36KR.replace("'", "'''")
+    cmd = f"agent-browser open '{url}' && (agent-browser wait '.kr-flow-article-item' || echo 'timeout') && agent-browser eval '{js_escaped}' && agent-browser close"
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        lines = proc.stdout.splitlines()
-
-        results = []
-        current_item = None
-
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-
-            m = re.match(r"^\d+\.\s+(.+)$", line)
-            if m:
-                if current_item and current_item["url"]:
-                    results.append(current_item)
-                current_item = {
-                    "source": "36kr",
-                    "title": m.group(1),
-                    "url": "",
-                    "snippet": "",
-                    "author": "36氪",
-                    "date": "",
-                }
-            elif current_item:
-                if not current_item["url"] and line.startswith("http"):
-                    current_item["url"] = line
-                elif not current_item["snippet"] and current_item["url"]:
-                    current_item["snippet"] = line
-
-        if current_item and current_item["url"]:
-            results.append(current_item)
-
-        return results[:limit]
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
+        result_json = proc.stdout.strip()
+        
+        if not result_json or "timeout" in result_json.lower():
+            return []
+            
+        match = re.search(r"(\[.*\])", result_json, re.DOTALL)
+        if match:
+            items = json.loads(match.group(1))
+            return items[:limit]
+        return []
     except subprocess.CalledProcessError as e:
-        print(f"[36kr] Error: exauro failed: {e.stderr}", file=sys.stderr)
+        print(f"[36kr] Error: agent-browser failed: {e.stderr}", file=sys.stderr)
+        subprocess.run("agent-browser close", shell=True, capture_output=True)
         return []
     except Exception as e:
         print(f"[36kr] Error: {e}", file=sys.stderr)
+        subprocess.run("agent-browser close", shell=True, capture_output=True)
         return []
 
 
@@ -121,13 +106,10 @@ def search_zhihu(query, limit=5):
 
 def read_url(url):
     """Open a URL and return the page content as text."""
+    js = "document.body ? document.body.innerText : ''"
+    cmd = f'agent-browser open "{url}" && agent-browser eval "{js}" && agent-browser close'
     try:
-        subprocess.run(["agent-browser", "open", url], check=True, capture_output=True)
-        proc = subprocess.run(
-            ["agent-browser", "eval", "document.body?.innerText || ''"],
-            capture_output=True, text=True, check=True,
-        )
-        subprocess.run(["agent-browser", "close"], capture_output=True)
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
         text = proc.stdout.strip()
         if text:
             print(text)
@@ -135,10 +117,10 @@ def read_url(url):
             print("Error: failed to extract page content", file=sys.stderr)
     except subprocess.CalledProcessError as e:
         print(f"Error: agent-browser failed: {e.stderr}", file=sys.stderr)
-        subprocess.run(["agent-browser", "close"], capture_output=True)
+        subprocess.run("agent-browser close", shell=True, capture_output=True)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
-        subprocess.run(["agent-browser", "close"], capture_output=True)
+        subprocess.run("agent-browser close", shell=True, capture_output=True)
 
 
 # --- Output ---
@@ -185,7 +167,7 @@ MC_SOURCES = {
 ALL_SOURCES = {
     "wechat": search_wechat,
     "36kr": search_36kr,
-    **MC_SOURCES,
+    **MC_SOURCES
 }
 
 
