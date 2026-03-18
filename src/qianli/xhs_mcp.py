@@ -262,6 +262,22 @@ def search_xhs(query, limit=5):
         print(f"[xhs] {e}", file=sys.stderr)
         return []
 
+    # Pre-flight: check login status to avoid hanging on unauthenticated search
+    try:
+        status_result = session.call_tool("check_login_status", timeout=15)
+        status_text = _extract_text(status_result)
+        if "未登录" in status_text or "not logged" in status_text.lower():
+            print(
+                "[xhs] Not logged in. Export cookies via Cookie-Editor and "
+                "place them in ~/code/xiaohongshu-mcp/data/cookies.json, "
+                "then restart the container.",
+                file=sys.stderr,
+            )
+            return []
+    except XHSMCPError as e:
+        print(f"[xhs] Login check failed: {e}", file=sys.stderr)
+        return []
+
     try:
         result = session.call_tool("search_feeds", {"keyword": query})
     except XHSNotLoggedIn:
