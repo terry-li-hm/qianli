@@ -1,6 +1,6 @@
 """qianli: Search Chinese content platforms.
 
-Sources: WeChat 公众号 (Exauro), 36kr (agent-browser), XHS, Zhihu (MediaCrawler).
+Sources: WeChat (Exauro), 36kr (agent-browser), XHS (xiaohongshu-mcp), Zhihu (MediaCrawler).
 """
 
 import argparse
@@ -10,7 +10,7 @@ import subprocess
 import re
 from urllib.parse import quote
 
-from qianli.mc import run_mc_search
+from qianli.xhs_mcp import search_xhs, check_status as xhs_check_status
 
 
 # --- JS extractors ---
@@ -27,15 +27,15 @@ def search_wechat(query, limit=5):
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
         lines = proc.stdout.splitlines()
-        
+
         results = []
         current_item = None
-        
+
         for line in lines:
             line = line.strip()
             if not line:
                 continue
-                
+
             # Match "N. <title>"
             match = re.match(r"^\d+\.\s+(.+)$", line)
             if match:
@@ -53,10 +53,10 @@ def search_wechat(query, limit=5):
                         current_item["url"] = line
                 elif "snippet" not in current_item:
                     current_item["snippet"] = line
-        
+
         if current_item and "title" in current_item:
             results.append(current_item)
-            
+
         return results[:limit]
     except subprocess.CalledProcessError as e:
         print(f"[wechat] Error: exauro failed: {e.stderr}", file=sys.stderr)
@@ -75,10 +75,10 @@ def search_36kr(query, limit=5):
     try:
         proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
         result_json = proc.stdout.strip()
-        
+
         if not result_json or "timeout" in result_json.lower():
             return []
-            
+
         match = re.search(r"(\[.*\])", result_json, re.DOTALL)
         if match:
             items = json.loads(match.group(1))
@@ -94,14 +94,14 @@ def search_36kr(query, limit=5):
         return []
 
 
-def search_xhs(query, limit=5):
-    """Search XHS posts via MediaCrawler."""
-    return run_mc_search("xhs", query, limit)
-
-
 def search_zhihu(query, limit=5):
     """Search Zhihu content via MediaCrawler."""
-    return run_mc_search("zhihu", query, limit)
+    try:
+        from qianli.mc import run_mc_search
+        return run_mc_search("zhihu", query, limit)
+    except Exception as e:
+        print(f"[zhihu] Error: {e}", file=sys.stderr)
+        return []
 
 
 def read_url(url):
@@ -121,6 +121,57 @@ def read_url(url):
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         subprocess.run("agent-browser close", shell=True, capture_output=True)
+
+
+def doctor():
+    """Check health of all backends."""
+    print("qianli doctor\n")
+
+    # XHS (xiaohongshu-mcp)
+    running, logged_in, msg = xhs_check_status()
+    if running and logged_in:
+        print("[xhs] OK — xiaohongshu-mcp running, logged in")
+    elif running:
+        print(f"[xhs] WARN — xiaohongshu-mcp running but not logged in")
+        print(f"       {msg}")
+    else:
+        print(f"[xhs] FAIL — {msg}")
+
+    # Zhihu (MediaCrawler)
+    try:
+        from qianli.mc import MC_DIR, MC_PYTHON
+        if MC_DIR.exists() and MC_PYTHON.exists():
+            print("[zhihu] OK — MediaCrawler found")
+        elif MC_DIR.exists():
+            print("[zhihu] WARN — MediaCrawler found but venv missing")
+        else:
+            print("[zhihu] SKIP — MediaCrawler not installed")
+    except Exception as e:
+        print(f"[zhihu] FAIL — {e}")
+
+    # Exauro (WeChat)
+    try:
+        proc = subprocess.run(["exauro", "--version"], capture_output=True, text=True, timeout=5)
+        if proc.returncode == 0:
+            print(f"[wechat] OK — exauro {proc.stdout.strip()}")
+        else:
+            print("[wechat] WARN — exauro found but returned error")
+    except FileNotFoundError:
+        print("[wechat] FAIL — exauro not found")
+    except Exception as e:
+        print(f"[wechat] FAIL — {e}")
+
+    # agent-browser (36kr)
+    try:
+        proc = subprocess.run(["agent-browser", "--version"], capture_output=True, text=True, timeout=5)
+        if proc.returncode == 0:
+            print(f"[36kr] OK — agent-browser {proc.stdout.strip()}")
+        else:
+            print("[36kr] WARN — agent-browser found but returned error")
+    except FileNotFoundError:
+        print("[36kr] FAIL — agent-browser not found")
+    except Exception as e:
+        print(f"[36kr] FAIL — {e}")
 
 
 # --- Output ---
@@ -159,16 +210,15 @@ def format_json(results):
 
 # --- CLI ---
 
-MC_SOURCES = {
+ALL_SOURCES = {
+    "wechat": search_wechat,
+    "36kr": search_36kr,
     "xhs": search_xhs,
     "zhihu": search_zhihu,
 }
 
-ALL_SOURCES = {
-    "wechat": search_wechat,
-    "36kr": search_36kr,
-    **MC_SOURCES
-}
+# Sources included in `qianli all`
+ALL_SEARCH_SOURCES = ["wechat", "36kr", "xhs"]
 
 
 def main():
@@ -183,7 +233,7 @@ def main():
         p.add_argument("--limit", type=int, default=5)
         p.add_argument("--json", action="store_true", dest="json_out")
 
-    p_all = sub.add_parser("all", help="Search wechat + 36kr")
+    p_all = sub.add_parser("all", help="Search wechat + 36kr + xhs")
     p_all.add_argument("query", help="Search query")
     p_all.add_argument("--limit", type=int, default=3)
     p_all.add_argument("--json", action="store_true", dest="json_out")
@@ -191,11 +241,17 @@ def main():
     p_read = sub.add_parser("read", help="Read full content from a URL")
     p_read.add_argument("url", help="URL to read")
 
+    sub.add_parser("doctor", help="Check health of all backends")
+
     args = parser.parse_args()
 
     if not args.command:
         parser.print_help()
         sys.exit(1)
+
+    if args.command == "doctor":
+        doctor()
+        return
 
     if args.command == "read":
         read_url(args.url)
@@ -203,7 +259,7 @@ def main():
 
     if args.command == "all":
         all_results = []
-        for name in ["wechat", "36kr"]:
+        for name in ALL_SEARCH_SOURCES:
             fn = ALL_SOURCES[name]
             try:
                 results = fn(args.query, args.limit)
